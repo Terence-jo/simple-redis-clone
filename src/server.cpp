@@ -126,14 +126,14 @@ static bool try_fill_buffer(Conn *conn) {
   // its capacity.
   assert(conn->rbuf_contents_size <= sizeof(conn->rbuf));
 
-  size_t remain = conn->rbuf_contents_size - conn->rbuf_consumed;
-  if (remain && conn->rbuf_consumed > 0) {
-    memmove(conn->rbuf, &conn->rbuf[conn->rbuf_consumed], remain);
-    conn->rbuf_consumed = 0;
+  size_t remain = conn->rbuf_contents_size - conn->wbuf_contents_size;
+  if (remain && conn->wbuf_contents_size > 0) {
+    memmove(conn->rbuf, &conn->rbuf[conn->wbuf_contents_size], remain);
+    conn->wbuf_contents_size = 0;
   }
-  if (conn->wbuf_contents_size == 0) {
-    conn->rbuf_consumed = 0;
-  }
+  // if (conn->wbuf_contents_size == 0) {
+  //   conn->wbuf_contents_size = 0;
+  // }
   conn->rbuf_contents_size = remain;
 
   ssize_t rv = 0;
