@@ -6,7 +6,7 @@
            "request": "launch",
            "name": "C++",
            "console": "integratedTerminal",
-           "preLaunchTask": "compile",
+           "preLaunchTask": "compile g++",
            "postDebugTask": "clean",
            "expressions": "native",
            "program": "${workspaceFolder}/${fileBasenameNoExtension}"

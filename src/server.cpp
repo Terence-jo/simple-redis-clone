@@ -30,7 +30,7 @@
  * happens most often with EAGAIN signals.
  */
 
-const size_t k_max_msg = 4096;
+const size_t k_max_msg = 6;
 
 enum {
   STATE_REQ = 0,
@@ -43,7 +43,7 @@ struct Conn {
   uint32_t state = 0; // either STATE_REQ or STATE_RES
   // buffer for reading
   size_t rbuf_contents_size = 0;
-  size_t rbuf_read = 0;
+  size_t rbuf_consumed = 0;
   uint8_t rbuf[4 + k_max_msg];
   // buffer for writing
   size_t wbuf_contents_size = 0;
@@ -109,7 +109,7 @@ static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int serverfd) {
   conn->fd = connfd;
   conn->state = STATE_REQ;
   conn->rbuf_contents_size = 0;
-  conn->rbuf_read = 0;
+  conn->rbuf_consumed = 0;
   conn->wbuf_contents_size = 0;
   conn->wbuf_sent = 0;
   conn_put(fd2conn, conn);
@@ -124,13 +124,15 @@ static bool try_fill_buffer(Conn *conn) {
   // this is why the `rbuf_contents_size` field is important,
   // we need to track the buffer contents relative to
   // its capacity.
-  assert(conn->rbuf_contents_size < sizeof(conn->rbuf) &&
-         conn->rbuf_read <= conn->rbuf_contents_size);
+  assert(conn->rbuf_contents_size <= sizeof(conn->rbuf));
 
-  size_t remain = conn->rbuf_contents_size - conn->rbuf_read;
-  if (remain && conn->rbuf_read > 0) {
-    memmove(conn->rbuf, &conn->rbuf[conn->rbuf_read], remain);
-    conn->rbuf_read = 0;
+  size_t remain = conn->rbuf_contents_size - conn->rbuf_consumed;
+  if (remain && conn->rbuf_consumed > 0) {
+    memmove(conn->rbuf, &conn->rbuf[conn->rbuf_consumed], remain);
+    conn->rbuf_consumed = 0;
+  }
+  if (conn->wbuf_contents_size == 0) {
+    conn->rbuf_consumed = 0;
   }
   conn->rbuf_contents_size = remain;
 
@@ -172,14 +174,14 @@ static bool try_fill_buffer(Conn *conn) {
 }
 
 static bool try_one_request(Conn *conn) {
-  size_t unread = conn->rbuf_contents_size - conn->rbuf_read;
+  size_t unread = conn->rbuf_contents_size - conn->rbuf_consumed;
   // try to parse a request from the buffer
   if (unread < 4) {
     // incomplete request, wait for next read
     return false;
   }
   uint32_t len = 0;
-  memcpy(&len, &conn->rbuf[conn->rbuf_read], 4);
+  memcpy(&len, &conn->rbuf[conn->rbuf_consumed], 4);
   if (len > k_max_msg) {
     msg("too long");
     conn->state = STATE_END;
@@ -192,18 +194,30 @@ static bool try_one_request(Conn *conn) {
 
   // got a request, do something with it. %.*s allows us to specify
   // the length of a substring to print.
-  printf("client says: %.*s\n", len, &conn->rbuf[conn->rbuf_read + 4]);
+  printf("client says: %.*s\n", len, &conn->rbuf[conn->rbuf_consumed + 4]);
 
-  // generate echoing response
-  memcpy(conn->wbuf, &len, 4);
-  memcpy(&conn->wbuf[4], &conn->rbuf[conn->rbuf_read + 4], len);
-  conn->wbuf_contents_size += 4 + len;
+  size_t next_size = conn->wbuf_contents_size + 4 + len;
+  if (next_size <= sizeof(conn->wbuf)) {
+    // generate echoing response
+    memcpy(&conn->wbuf[conn->wbuf_contents_size], &len, 4);
+    memcpy(&conn->wbuf[conn->wbuf_contents_size + 4],
+           &conn->rbuf[conn->rbuf_consumed + 4], len);
+    conn->wbuf_contents_size += 4 + len;
+  } else {
+    conn->state = STATE_RES;
+    return false;
+  }
 
-  // remove the request from the buffer.
-  conn->rbuf_read += 4 + len;
+  // update data read
+  conn->rbuf_consumed += 4 + len;
 
-  conn->state = STATE_RES;
-  state_res(conn);
+  if (conn->rbuf_consumed == conn->rbuf_contents_size) {
+    conn->state = STATE_RES;
+    state_res(conn);
+  }
+
+  // conn->state = STATE_RES;
+  // state_res(conn);
 
   // continue the outer loop if the request was fully processed
   return (conn->state == STATE_REQ);
@@ -359,7 +373,8 @@ int main() {
     // TODO: Figure out what goes into optimising event array size and number
     // of events retrieved at once
     struct kevent event[10];
-    // check for events, only handle one per iteration of the event loop
+    // check for events, only handle one per iteration of the event loop.
+    // this blocks indefinitely when there are no events. is that ok?
     int new_events = kevent(kq, NULL, 0, event, 1, NULL);
     if (new_events < 0) {
       msg("kevent() retrieval error");
