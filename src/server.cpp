@@ -13,15 +13,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/event.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
 
 /*
- * A simple TCP server. `read_full()` and `write_full()` are just helper
- * wrappers around syscalls to account for smaller returns than expected
- * from the kernel.
+ * A simple TCP server running in an event loop. Note: this server is
+ * employing pipelining, looping trough each possible request in a full
+ * read buffer before the next read. A number of operations within the
+ * pipelining loop may return false, breaking the loop and waiting for "the next
+ * iteration". This is specifically the next iteration of the event loop, after
+ * connections have been polled again. Read buffer contents for each connection
+ * will persist until the buffer can be filled, processed, and cleared. This
+ * happens most often with EAGAIN signals.
  */
 
 const size_t k_max_msg = 4096;
@@ -81,10 +87,10 @@ static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn) {
   fd2conn[conn->fd] = conn;
 }
 
-static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd) {
+static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int serverfd) {
   struct sockaddr_in client_addr = {};
   socklen_t addrlen = sizeof(client_addr);
-  int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
+  int connfd = accept(serverfd, (struct sockaddr *)&client_addr, &addrlen);
   if (connfd < 0) {
     msg("accept() error");
     return -1;
@@ -108,53 +114,12 @@ static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd) {
   return 0;
 }
 
+static bool try_one_request(Conn *conn);
 static void state_res(Conn *conn);
 static void state_req(Conn *conn);
 
-static bool try_one_request(Conn *conn) {
-  // try to parse a request from the buffer
-  if (conn->rbuf_contents_size < 4) {
-    // incomplete request, wait for next read
-    return false;
-  }
-  uint32_t len = 0;
-  memcpy(&len, conn->rbuf, 4);
-  if (len > k_max_msg) {
-    msg("too long");
-    conn->state = STATE_END;
-    return false;
-  }
-  if (4 + len > conn->rbuf_contents_size) {
-    // incomplete message, retry next iteration
-    return false;
-  }
-
-  // got a request, do something with it
-  printf("client says: %.*s\n", len, &conn->rbuf[4]);
-
-  // generate echoing response
-  memcpy(conn->wbuf, &len, 4);
-  memcpy(&conn->wbuf[4], &conn->rbuf[4], len);
-  conn->wbuf_contents_size += 4 + len;
-
-  // remove the request from the buffer.
-  // note: frequent memmove is inefficient. this is not
-  // the best way of achieving this, it is just uncomplicated
-  size_t remain = conn->rbuf_contents_size - 4 - len;
-  if (remain) {
-    memmove(conn->rbuf, &conn->rbuf[4 + len], remain);
-  }
-  conn->rbuf_contents_size = remain;
-
-  conn->state = STATE_RES;
-  state_res(conn);
-
-  // continue the outer loop if the request was fully processed
-  return (conn->state == STATE_REQ);
-}
-
 static bool try_fill_buffer(Conn *conn) {
-  // this is why the `rbuf_size` field is important,
+  // this is why the `rbuf_contents_size` field is important,
   // we need to track the buffer contents relative to
   // its capacity.
   assert(conn->rbuf_contents_size < sizeof(conn->rbuf));
@@ -195,10 +160,47 @@ static bool try_fill_buffer(Conn *conn) {
   return (conn->state == STATE_REQ);
 }
 
-// state machine reader
-static void state_req(Conn *conn) {
-  while (try_fill_buffer(conn)) {
+static bool try_one_request(Conn *conn) {
+  // try to parse a request from the buffer
+  if (conn->rbuf_contents_size < 4) {
+    // incomplete request, wait for next read
+    return false;
   }
+  uint32_t len = 0;
+  memcpy(&len, conn->rbuf, 4);
+  if (len > k_max_msg) {
+    msg("too long");
+    conn->state = STATE_END;
+    return false;
+  }
+  if (4 + len > conn->rbuf_contents_size) {
+    // incomplete message, retry next iteration
+    return false;
+  }
+
+  // got a request, do something with it. %.*s allows us to specify
+  // the length of a substring to print.
+  printf("client says: %.*s\n", len, &conn->rbuf[4]);
+
+  // generate echoing response
+  memcpy(conn->wbuf, &len, 4);
+  memcpy(&conn->wbuf[4], &conn->rbuf[4], len);
+  conn->wbuf_contents_size += 4 + len;
+
+  // remove the request from the buffer.
+  // note: frequent memmove is inefficient. this is not
+  // the best way of achieving this, it is just uncomplicated
+  size_t remain = conn->rbuf_contents_size - 4 - len;
+  if (remain) {
+    memmove(conn->rbuf, &conn->rbuf[4 + len], remain);
+  }
+  conn->rbuf_contents_size = remain;
+
+  conn->state = STATE_RES;
+  state_res(conn);
+
+  // continue the outer loop if the request was fully processed
+  return (conn->state == STATE_REQ);
 }
 
 static bool try_flush_buffer(Conn *conn) {
@@ -235,6 +237,12 @@ static void state_res(Conn *conn) {
   }
 }
 
+// state machine reader
+static void state_req(Conn *conn) {
+  while (try_fill_buffer(conn)) {
+  }
+}
+
 // state machine for client connections:
 static void connection_io(Conn *conn) {
   if (conn->state == STATE_REQ) {
@@ -246,9 +254,38 @@ static void connection_io(Conn *conn) {
   }
 }
 
+// create a kqueue. this involves registering the listening port
+// with the kqueue, with the event to watch for being EV_READ, which
+// translates to incoming connections on a listening socket. the flags
+// EV_ADD and EV_ENABLE mean this incoming connections will be added to
+// the kqueue and allow `kevent()` to return the event if triggered.
+int new_listening_kqueue(int fd) {
+  int kq = kqueue();
+  if (kq < 0) {
+    msg("kqueue() error");
+    return -1;
+  }
+
+  struct kevent change_event = {};
+  // EV_SET macro can simplify this initialisation.
+  change_event.ident = fd;
+  change_event.filter = EVFILT_READ;
+  change_event.flags = EV_ADD | EV_ENABLE;
+  change_event.fflags = 0;
+  change_event.data = 0;
+  change_event.udata = 0;
+
+  if (kevent(kq, &change_event, 1, NULL, 0, NULL) < 0) {
+    msg("kevent() error");
+    return -1;
+  }
+
+  return kq;
+}
+
 int main() {
   // Create a TCP socket. PF_INET is for IPV4, SOCK_STREAM is for TCP.
-  int fd = socket(PF_INET, SOCK_STREAM, 0);
+  int serverfd = socket(PF_INET, SOCK_STREAM, 0);
   // Configure the socket to reuse it's address on restart.
   int val = 1;
   // SOL_SOCKET states that the level we are concerned with options
@@ -256,7 +293,7 @@ int main() {
   // concerned with, and the pointer to `val` provides the value
   // we want to set. The option value is arbitrary bytes, so we
   // must provide its size.
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
+  setsockopt(serverfd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
   //======================
   // Binding an address
@@ -264,13 +301,12 @@ int main() {
   struct sockaddr_in addr = {};
   addr.sin_family = PF_INET;
   // Using wildcard address 0.0.0.0:1234
-  // ntohs and ntohl convert to big-endian for us.
-  // ntohs gives us the network-order (big-endian) short value, or
-  // port, and ntohl gives us the net-order long, the address.
-  addr.sin_port = ntohs(1234);
-  addr.sin_addr.s_addr = ntohl(0); // 0.0.0.0
+  // htons and htonl are host-to-network short
+  // and long respectively.
+  addr.sin_port = htons(1234);
+  addr.sin_addr.s_addr = htonl(0); // 0.0.0.0
 
-  int rv = bind(fd, (const sockaddr *)&addr, sizeof(addr));
+  int rv = bind(serverfd, (const sockaddr *)&addr, sizeof(addr));
   if (rv) {
     die("bind()");
   }
@@ -278,7 +314,7 @@ int main() {
   // Second argument to `listen()` is backlog, the maximum queue
   // length for waiting connections. After `listen()` the OS will
   // automatically handle TCP handshakes etc.
-  rv = listen(fd, SOMAXCONN);
+  rv = listen(serverfd, SOMAXCONN);
   if (rv) {
     die("listen()");
   }
@@ -291,53 +327,61 @@ int main() {
   std::vector<Conn *> fd2conn;
 
   // set listening socket to nonblocking
-  fd_set_nb(fd);
+  fd_set_nb(serverfd);
 
   // event loop
-  std::vector<struct pollfd> poll_args;
+  int kq = new_listening_kqueue(serverfd);
   while (true) {
-    // prepare arguments of the poll()
-    poll_args.clear();
-    // put listening fd in the first position for convenience
-    struct pollfd pfd = {fd, POLLIN, 0};
-    poll_args.push_back(pfd);
-    // connection fds
+    // connection fds, make sure they're all in the event queue
     for (Conn *conn : fd2conn) {
       if (!conn) {
         continue;
       }
-      struct pollfd pfd = {};
-      pfd.fd = conn->fd;
-      pfd.events = (conn->state == STATE_REQ) ? POLLIN : POLLOUT;
-      // Add a bitmask flag?
-      pfd.events = pfd.events | POLLERR;
-      poll_args.push_back(pfd);
-    }
-
-    // poll for active connections
-    int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), 1000);
-    if (rv < 0) {
-      die("poll");
-    }
-
-    // process active connections
-    for (size_t i = 1; i < poll_args.size(); i++) {
-      if (poll_args[i].revents) {
-        Conn *conn = fd2conn[poll_args[i].fd];
-        connection_io(conn);
-        if (conn->state == STATE_END) {
-          // Client closed or something bad happened, clean up
-          fd2conn[conn->fd] = NULL;
-          (void)close(conn->fd);
-          free(conn);
-        }
+      struct kevent event_to_add = {};
+      event_to_add.ident = conn->fd;
+      event_to_add.filter = EVFILT_READ;
+      event_to_add.flags = EV_ADD;
+      event_to_add.fflags = 0;
+      event_to_add.data = 0;
+      event_to_add.udata = NULL;
+      if (kevent(kq, &event_to_add, 1, NULL, 0, NULL) < 0) {
+        msg("kevent() placement error");
+        return -1;
       }
     }
 
-    // try to accept new connections, remember the listener is the start of
-    // poll_args
-    if (poll_args[0].revents) {
-      (void)accept_new_conn(fd2conn, fd);
+    // TODO: Figure out what goes into optimising event array size and number
+    // of events retrieved at once
+    struct kevent event[10];
+    // check for events, only handle one per iteration of the event loop
+    int new_events = kevent(kq, NULL, 0, event, 1, NULL);
+    if (new_events < 0) {
+      msg("kevent() retrieval error");
+      return -1;
+    } else if (new_events == 0) {
+      msg("no events");
+      continue;
+    }
+
+    // process active connections, skipping the listening socket
+    int event_fd = event->ident;
+    if (event_fd == serverfd) {
+      // new connection request, accept
+      (void)accept_new_conn(fd2conn, serverfd);
+    } else if (event->flags & EVFILT_READ) {
+      Conn *conn = fd2conn[event_fd];
+      if (event->flags & EV_EOF) {
+        // client has closed
+        conn->state = STATE_END;
+      } else {
+        connection_io(conn);
+      }
+      if (conn->state == STATE_END) {
+        // Client closed or something bad happened, clean up
+        fd2conn[conn->fd] = NULL;
+        (void)close(conn->fd);
+        free(conn);
+      }
     }
   }
 
