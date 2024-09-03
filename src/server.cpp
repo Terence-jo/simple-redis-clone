@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/event.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
@@ -47,36 +48,6 @@ enum {
 
 // placeholder data structure for the key space
 static std::map<std::string, std::string> g_map;
-
-static uint32_t do_get(const std::vector<std::string> &cmd, unsigned char *res,
-                       uint32_t *reslen) {
-  if (!g_map.count(cmd[1])) {
-    // key does not exist
-    return RES_NX;
-  }
-  std::string &val = g_map[cmd[1]];
-  assert(val.size() <= k_max_msg);
-  memcpy(res, val.data(), val.size());
-  *reslen = (uint32_t)val.size();
-  return RES_OK;
-}
-
-static uint32_t do_set(const std::vector<std::string> &cmd, unsigned char *res,
-                       uint32_t *reslen) {
-  (void)res;
-  (void)reslen;
-  g_map[cmd[1]] = cmd[2];
-  return RES_OK;
-}
-
-static uint32_t do_del(const std::vector<std::string> &cmd, unsigned char *res,
-                       uint32_t *reslen) {
-  // map.erase() does not throw exceptions if the element isn't there
-  (void)res;
-  (void)reslen;
-  g_map.erase(cmd[1]);
-  return RES_OK;
-}
 
 struct Conn {
   int fd = -1;
@@ -213,6 +184,8 @@ static bool try_fill_buffer(Conn *conn) {
   return (conn->state == STATE_REQ);
 }
 
+const uint32_t k_max_args = 1024;
+
 static int32_t parse_req(const unsigned char *req, uint32_t reqlen,
                          std::vector<std::string> &out) {
   // make sure we've at least got our length header, this time telling us
@@ -225,7 +198,7 @@ static int32_t parse_req(const unsigned char *req, uint32_t reqlen,
 
   uint32_t n = 0;
   memcpy(&n, req, 4);
-  if (n < 0) {
+  if (n > k_max_args) {
     return -1;
   }
 
@@ -252,6 +225,39 @@ static int32_t parse_req(const unsigned char *req, uint32_t reqlen,
     return -1;
   }
   return 0;
+}
+
+static bool cmd_is(const std::string &cmd, const char *cmd_wanted) {
+  return strcasecmp(cmd.c_str(), cmd_wanted);
+}
+static uint32_t do_get(const std::vector<std::string> &cmd, unsigned char *res,
+                       uint32_t *reslen) {
+  if (!g_map.count(cmd[1])) {
+    // key does not exist
+    return RES_NX;
+  }
+  std::string &val = g_map[cmd[1]];
+  assert(val.size() <= k_max_msg);
+  memcpy(res, val.data(), val.size());
+  *reslen = (uint32_t)val.size();
+  return RES_OK;
+}
+
+static uint32_t do_set(const std::vector<std::string> &cmd, unsigned char *res,
+                       uint32_t *reslen) {
+  (void)res;
+  (void)reslen;
+  g_map[cmd[1]] = cmd[2];
+  return RES_OK;
+}
+
+static uint32_t do_del(const std::vector<std::string> &cmd, unsigned char *res,
+                       uint32_t *reslen) {
+  // map.erase() does not throw exceptions if the element isn't there
+  (void)res;
+  (void)reslen;
+  g_map.erase(cmd[1]);
+  return RES_OK;
 }
 
 static int32_t do_request(const unsigned char *req, uint32_t reqlen,
