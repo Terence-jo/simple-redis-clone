@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <errno.h>
 #include <fcntl.h>
+#include <map>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <poll.h>
@@ -30,13 +31,52 @@
  * happens most often with EAGAIN signals.
  */
 
-const size_t k_max_msg = 6;
+const size_t k_max_msg = 4096;
 
 enum {
   STATE_REQ = 0,
   STATE_RES = 1,
   STATE_END = 2, // mark the connection for deletion
 };
+
+enum {
+  RES_OK = 0,
+  RES_ERR = 1,
+  RES_NX = 2,
+};
+
+// placeholder data structure for the key space
+static std::map<std::string, std::string> g_map;
+
+static uint32_t do_get(const std::vector<std::string> &cmd, unsigned char *res,
+                       uint32_t *reslen) {
+  if (!g_map.count(cmd[1])) {
+    // key does not exist
+    return RES_NX;
+  }
+  std::string &val = g_map[cmd[1]];
+  assert(val.size() <= k_max_msg);
+  memcpy(res, val.data(), val.size());
+  *reslen = (uint32_t)val.size();
+  return RES_OK;
+}
+
+static uint32_t do_set(const std::vector<std::string> &cmd, unsigned char *res,
+                       uint32_t *reslen) {
+  (void)res;
+  (void)reslen;
+  g_map[cmd[1]] = cmd[2];
+  return RES_OK;
+}
+
+static uint32_t do_del(const std::vector<std::string> &cmd, unsigned char *res,
+                       uint32_t *reslen) {
+  // map.erase() does not throw exceptions if the element isn't there
+  (void)res;
+  (void)reslen;
+  g_map.erase(cmd[1]);
+  return RES_OK;
+}
 
 struct Conn {
   int fd = -1;
@@ -173,6 +213,72 @@ static bool try_fill_buffer(Conn *conn) {
   return (conn->state == STATE_REQ);
 }
 
+static int32_t parse_req(const unsigned char *req, uint32_t reqlen,
+                         std::vector<std::string> &out) {
+  // make sure we've at least got our length header, this time telling us
+  // how many strings we've got. then read the header, and start
+  // iterating through the buffer, decrementing our num strings value
+  // until we've added all the strings to `out`
+  if (reqlen < 4) {
+    return -1;
+  }
+
+  uint32_t n = 0;
+  memcpy(&n, req, 4);
+  if (n < 0) {
+    return -1;
+  }
+
+  size_t pos = 4;
+  while (n--) { // nifty syntax, when n hits zero this will become false
+    // make sure we've got the string length header
+    if (pos + 4 > reqlen) {
+      return -1;
+    }
+    // parse strings like before: read length header, read data
+    size_t sz = 0;
+    memcpy(&sz, &req[pos], 4);
+    pos += 4;
+    if (pos + sz > reqlen) {
+      return -1;
+    }
+    // cast as char array and construct a string by passing length
+    out.push_back(std::string((char *)&req[pos], sz));
+    pos += sz;
+  }
+
+  if (pos != reqlen) {
+    // trailing garbage after n strings
+    return -1;
+  }
+  return 0;
+}
+
+static int32_t do_request(const unsigned char *req, uint32_t reqlen,
+                          uint32_t *rescode, unsigned char *res,
+                          uint32_t *reslen) {
+  std::vector<std::string> cmd;
+  if (0 != parse_req(req, reqlen, cmd)) {
+    msg("bad req");
+    return -1;
+  }
+  if (cmd.size() == 2 && cmd_is(cmd[0], "get")) {
+    *rescode = do_get(cmd, res, reslen);
+  } else if (cmd.size() == 3 && cmd_is(cmd[0], "set")) {
+    *rescode = do_set(cmd, res, reslen);
+  } else if (cmd.size() == 2 && cmd_is(cmd[0], "del")) {
+    *rescode = do_del(cmd, res, reslen);
+  } else {
+    // cmd is not recognised
+    *rescode = RES_ERR;
+    const char *msg = "Unkown cmd";
+    strcpy((char *)res, msg);
+    *reslen = strlen(msg);
+    return 0; // leave request protocol errors to the client
+  }
+  return 0;
+}
+
 static bool try_one_request(Conn *conn) {
   size_t unread = conn->rbuf_contents_size - conn->rbuf_consumed;
   // try to parse a request from the buffer
@@ -192,17 +298,25 @@ static bool try_one_request(Conn *conn) {
     return false;
   }
 
-  // got a request, do something with it. %.*s allows us to specify
-  // the length of a substring to print.
-  printf("client says: %.*s\n", len, &conn->rbuf[conn->rbuf_consumed + 4]);
-
-  size_t next_size = conn->wbuf_contents_size + 4 + len;
+  // got a request, generate a response
+  // first parse the command and put response in buffer with space
+  // for the length and response code.
+  size_t wbuf_msg_start = conn->wbuf_contents_size + 4 + 4;
+  size_t next_size = wbuf_msg_start + len;
   if (next_size <= sizeof(conn->wbuf)) {
-    // generate echoing response
-    memcpy(&conn->wbuf[conn->wbuf_contents_size], &len, 4);
-    memcpy(&conn->wbuf[conn->wbuf_contents_size + 4],
-           &conn->rbuf[conn->rbuf_consumed + 4], len);
-    conn->wbuf_contents_size += 4 + len;
+    uint32_t wlen = 0;
+    uint32_t rescode = 0;
+    int32_t err = do_request(&conn->rbuf[conn->rbuf_consumed + 4], len,
+                             &rescode, &conn->wbuf[wbuf_msg_start], &wlen);
+    if (err) {
+      conn->state = STATE_END;
+      return false;
+    }
+    wlen += 4;
+    memcpy(&conn->wbuf[conn->wbuf_contents_size], &wlen, 4);
+    memcpy(&conn->wbuf[conn->wbuf_contents_size + 4], &rescode, 4);
+    conn->wbuf_contents_size +=
+        4 + wlen; // wlen includes the rescode, then +4 for wlen
   } else {
     conn->state = STATE_RES;
     return false;
@@ -215,9 +329,6 @@ static bool try_one_request(Conn *conn) {
     conn->state = STATE_RES;
     state_res(conn);
   }
-
-  // conn->state = STATE_RES;
-  // state_res(conn);
 
   // continue the outer loop if the request was fully processed
   return (conn->state == STATE_REQ);
