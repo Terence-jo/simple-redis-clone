@@ -9,7 +9,7 @@
         {
             "label": "compile g++",
             "type": "shell",
-            "command": "g++ -O2 -ggdb ${relativeFile} -o ${fileBasenameNoExtension}"
+            "command": "g++ -g -ggdb ${relativeFile} -o ${fileBasenameNoExtension}"
         },
         {
             "label": "clean",

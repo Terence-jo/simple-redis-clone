@@ -10,6 +10,17 @@
            "postDebugTask": "clean",
            "expressions": "native",
            "program": "${workspaceFolder}/${fileBasenameNoExtension}"
+       },
+       {
+           "type": "codelldb",
+           "request": "launch",
+           "name": "redis client debug",
+           "console": "integratedTerminal",
+           "preLaunchTask": "compile g++",
+           "postDebugTask": "clean",
+           "expressions": "native",
+           "program": "${workspaceFolder}/${fileBasenameNoExtension}",
+           "args": ["set", "k", "v"]
        }
    ]
 }

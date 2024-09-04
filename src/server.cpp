@@ -228,7 +228,7 @@ static int32_t parse_req(const unsigned char *req, uint32_t reqlen,
 }
 
 static bool cmd_is(const std::string &cmd, const char *cmd_wanted) {
-  return strcasecmp(cmd.c_str(), cmd_wanted);
+  return 0 == strcasecmp(cmd.c_str(), cmd_wanted);
 }
 static uint32_t do_get(const std::vector<std::string> &cmd, unsigned char *res,
                        uint32_t *reslen) {
