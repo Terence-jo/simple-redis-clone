@@ -9,7 +9,7 @@
         {
             "label": "compile g++",
             "type": "shell",
-            "command": "g++ -g -ggdb ${relativeFile} -o ${fileBasenameNoExtension}"
+            "command": "g++ -g -ggdb ${relativeFile} src/hashtable.cpp -o ${fileBasenameNoExtension}"
         },
         {
             "label": "clean",

@@ -1,3 +1,4 @@
+#include "hashtable.h"
 #include <arpa/inet.h>
 #include <cassert>
 #include <cerrno>
@@ -31,6 +32,12 @@
  * will persist until the buffer can be filled, processed, and cleared. This
  * happens most often with EAGAIN signals.
  */
+
+#define container_of(ptr, type, member)                                        \
+  ({                                                                           \
+    const typeof(((type *)0)->member) *__mptr = (ptr);                         \
+    (type *)((char *)__mptr - offsetof(type, member));                         \
+  })
 
 const size_t k_max_msg = 4096;
 
@@ -230,33 +237,100 @@ static int32_t parse_req(const unsigned char *req, uint32_t reqlen,
 static bool cmd_is(const std::string &cmd, const char *cmd_wanted) {
   return 0 == strcasecmp(cmd.c_str(), cmd_wanted);
 }
-static uint32_t do_get(const std::vector<std::string> &cmd, unsigned char *res,
+
+/*==================================================
+Hashtable functionality
+==================================================*/
+// the global key space
+static struct {
+  HMap db;
+} g_data;
+
+struct Entry {
+  struct HNode node;
+  std::string key;
+  std::string val;
+};
+
+// I'll need to look up an explanation for this one
+static uint64_t str_hash(const unsigned char *data, size_t len) {
+  uint32_t h = 0x811C9DC5;
+  for (size_t i = 0; i < len; i++) {
+    h = (h + data[i]) * 0x01000193;
+  }
+  return h;
+}
+
+static bool entry_eq(HNode *lhs, HNode *rhs) {
+  struct Entry *le = container_of(lhs, struct Entry, node);
+  struct Entry *re = container_of(rhs, struct Entry, node);
+  return le->key == re->key; // just a string equality
+}
+
+static uint32_t do_get(std::vector<std::string> &cmd, unsigned char *res,
                        uint32_t *reslen) {
-  if (!g_map.count(cmd[1])) {
-    // key does not exist
+  // Create a key to find, fill it from the command and set its hash
+  Entry target;
+  target.key.swap(cmd[1]);
+  target.node.hcode =
+      str_hash((unsigned char *)target.key.data(), target.key.size());
+
+  HNode *node = hm_lookup(&g_data.db, &target.node, &entry_eq);
+  if (!node) {
     return RES_NX;
   }
-  std::string &val = g_map[cmd[1]];
-  assert(val.size() <= k_max_msg);
+  const std::string &val = container_of(node, struct Entry, node)->val;
+  assert(val.size() < k_max_msg);
   memcpy(res, val.data(), val.size());
   *reslen = (uint32_t)val.size();
   return RES_OK;
 }
 
-static uint32_t do_set(const std::vector<std::string> &cmd, unsigned char *res,
+// allocate an Entry (didn't need to do that above since `target` is only used
+// in the get), set the hash code, key, and value, then add it to g_data with
+// hm_insert
+static uint32_t do_set(std::vector<std::string> &cmd, unsigned char *res,
                        uint32_t *reslen) {
   (void)res;
   (void)reslen;
-  g_map[cmd[1]] = cmd[2];
+
+  // create a lookup target on the stack, only heap allocate if necessary,
+  // provide a fast path.
+  Entry target;
+  target.key.swap(cmd[1]);
+  target.node.hcode =
+      str_hash((unsigned char *)target.key.data(), target.key.size());
+  HNode *node = hm_lookup(&g_data.db, &target.node, &entry_eq);
+  if (node) {
+    container_of(node, Entry, node)->val.swap(cmd[2]);
+    return RES_OK;
+  }
+
+  // slow path
+  Entry *entry = new Entry;
+  entry->key.swap(target.key);
+  entry->val.swap(cmd[2]);
+  entry->node.hcode = target.node.hcode;
+  hm_insert(&g_data.db, &entry->node);
   return RES_OK;
 }
 
+// create a target entry, pop its node from the hmap, get its container and
+// deallocate its resources.
 static uint32_t do_del(const std::vector<std::string> &cmd, unsigned char *res,
                        uint32_t *reslen) {
-  // map.erase() does not throw exceptions if the element isn't there
   (void)res;
   (void)reslen;
-  g_map.erase(cmd[1]);
+  Entry target;
+  target.key = cmd[1];
+  target.node.hcode =
+      str_hash((unsigned char *)target.key.data(), target.key.size());
+
+  HNode *node = hm_pop(&g_data.db, &target.node, &entry_eq);
+  if (node) {
+    delete container_of(node, Entry, node);
+  }
+
   return RES_OK;
 }
 
