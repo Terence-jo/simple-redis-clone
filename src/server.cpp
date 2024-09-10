@@ -48,9 +48,16 @@ enum {
 };
 
 enum {
-  RES_OK = 0,
-  RES_ERR = 1,
-  RES_NX = 2,
+  ERR_UNKNOWN = 0,
+  ERR_2BIG = 1,
+};
+
+enum {
+  SER_NIL = 0, // like NULL
+  SER_ERR = 1, // error code and a message
+  SER_STR = 2, // string
+  SER_INT = 3, // int64
+  SER_ARR = 4, // array
 };
 
 // placeholder data structure for the key space
@@ -67,6 +74,9 @@ struct Conn {
   size_t wbuf_contents_size = 0;
   size_t wbuf_sent = 0;
   uint8_t wbuf[4 + k_max_msg];
+  // cache for a response that could not be written
+  // to the buffer
+  std::string resp_cache;
 };
 
 // Print error and exit. A C idiom.
@@ -267,8 +277,43 @@ static bool entry_eq(HNode *lhs, HNode *rhs) {
   return le->key == re->key; // just a string equality
 }
 
-static uint32_t do_get(std::vector<std::string> &cmd, unsigned char *res,
-                       uint32_t *reslen) {
+static void out_nil(std::string &out) { out.push_back(SER_NIL); }
+static void out_str(std::string &out, const std::string &val) {
+  out.push_back(SER_STR);
+  uint32_t len = (uint32_t)val.size();
+  out.append((char *)&len, 4);
+  out.append(val);
+}
+static void out_int(std::string &out, int64_t val) {
+  out.push_back(SER_INT);
+  out.append((char *)&val, 8);
+}
+static void out_err(std::string &out, int32_t code, const std::string &msg) {
+  out.push_back(SER_ERR);
+  out.append((char *)&code, 4);
+  uint32_t len = msg.size();
+  out.append((char *)&len, 4);
+  out.append(msg);
+}
+// array just puts the length in first, without packing elements
+static void out_arr(std::string &out, uint32_t n) {
+  out.push_back(SER_ARR);
+  out.append((char *)&n, 4);
+}
+
+static void cb_scan(HNode *node, void *arg) {
+  std::string &out = *(std::string *)arg;
+  out_str(out, container_of(node, Entry, node)->key);
+}
+
+static void do_keys(std::vector<std::string> &cmd, std::string &out) {
+  (void)cmd;
+  out_arr(out, (uint32_t)hm_size(&g_data.db));
+  h_scan(&g_data.db.htab1, &cb_scan, &out);
+  h_scan(&g_data.db.htab2, &cb_scan, &out);
+}
+
+static void do_get(std::vector<std::string> &cmd, std::string &out) {
   // Create a key to find, fill it from the command and set its hash
   Entry target;
   target.key.swap(cmd[1]);
@@ -277,23 +322,19 @@ static uint32_t do_get(std::vector<std::string> &cmd, unsigned char *res,
 
   HNode *node = hm_lookup(&g_data.db, &target.node, &entry_eq);
   if (!node) {
-    return RES_NX;
+    out_nil(out);
+    return;
   }
   const std::string &val = container_of(node, struct Entry, node)->val;
   assert(val.size() < k_max_msg);
-  memcpy(res, val.data(), val.size());
-  *reslen = (uint32_t)val.size();
-  return RES_OK;
+  out_str(out, val);
+  return;
 }
 
 // allocate an Entry (didn't need to do that above since `target` is only used
 // in the get), set the hash code, key, and value, then add it to g_data with
 // hm_insert
-static uint32_t do_set(std::vector<std::string> &cmd, unsigned char *res,
-                       uint32_t *reslen) {
-  (void)res;
-  (void)reslen;
-
+static void do_set(std::vector<std::string> &cmd, std::string &out) {
   // create a lookup target on the stack, only heap allocate if necessary,
   // provide a fast path.
   Entry target;
@@ -303,7 +344,8 @@ static uint32_t do_set(std::vector<std::string> &cmd, unsigned char *res,
   HNode *node = hm_lookup(&g_data.db, &target.node, &entry_eq);
   if (node) {
     container_of(node, Entry, node)->val.swap(cmd[2]);
-    return RES_OK;
+    out_nil(out);
+    return;
   }
 
   // slow path
@@ -312,15 +354,13 @@ static uint32_t do_set(std::vector<std::string> &cmd, unsigned char *res,
   entry->val.swap(cmd[2]);
   entry->node.hcode = target.node.hcode;
   hm_insert(&g_data.db, &entry->node);
-  return RES_OK;
+  out_nil(out);
+  return;
 }
 
 // create a target entry, pop its node from the hmap, get its container and
 // deallocate its resources.
-static uint32_t do_del(const std::vector<std::string> &cmd, unsigned char *res,
-                       uint32_t *reslen) {
-  (void)res;
-  (void)reslen;
+static void do_del(const std::vector<std::string> &cmd, std::string &out) {
   Entry target;
   target.key = cmd[1];
   target.node.hcode =
@@ -330,36 +370,31 @@ static uint32_t do_del(const std::vector<std::string> &cmd, unsigned char *res,
   if (node) {
     delete container_of(node, Entry, node);
   }
-
-  return RES_OK;
+  out_int(out, node ? 1 : 0);
+  return;
 }
 
-static int32_t do_request(const unsigned char *req, uint32_t reqlen,
-                          uint32_t *rescode, unsigned char *res,
-                          uint32_t *reslen) {
-  std::vector<std::string> cmd;
-  if (0 != parse_req(req, reqlen, cmd)) {
-    msg("bad req");
-    return -1;
-  }
-  if (cmd.size() == 2 && cmd_is(cmd[0], "get")) {
-    *rescode = do_get(cmd, res, reslen);
+static void do_request(std::vector<std::string> &cmd, std::string &out) {
+  if (cmd.size() == 1 && cmd_is(cmd[0], "keys")) {
+    do_keys(cmd, out);
+  } else if (cmd.size() == 2 && cmd_is(cmd[0], "get")) {
+    do_get(cmd, out);
   } else if (cmd.size() == 3 && cmd_is(cmd[0], "set")) {
-    *rescode = do_set(cmd, res, reslen);
+    do_set(cmd, out);
   } else if (cmd.size() == 2 && cmd_is(cmd[0], "del")) {
-    *rescode = do_del(cmd, res, reslen);
+    do_del(cmd, out);
   } else {
-    // cmd is not recognised
-    *rescode = RES_ERR;
-    const char *msg = "Unkown cmd";
-    strcpy((char *)res, msg);
-    *reslen = strlen(msg);
-    return 0; // leave request protocol errors to the client
+    out_err(out, ERR_UNKNOWN, "Unknown cmd");
   }
-  return 0;
 }
 
 static bool try_one_request(Conn *conn) {
+  if (conn->resp_cache.size() > 0) {
+    uint32_t cachelen = (uint32_t)conn->resp_cache.size();
+    memcpy(conn->wbuf, &cachelen, 4);
+    memcpy(&conn->wbuf[4], conn->resp_cache.data(), cachelen);
+    conn->resp_cache.clear();
+  }
   size_t unread = conn->rbuf_contents_size - conn->rbuf_consumed;
   // try to parse a request from the buffer
   if (unread < 4) {
@@ -378,26 +413,32 @@ static bool try_one_request(Conn *conn) {
     return false;
   }
 
+  // parse request
+  std::vector<std::string> cmd;
+  if (0 != parse_req(&conn->rbuf[4], len, cmd)) {
+    msg("bad request");
+    conn->state = STATE_END;
+    return false;
+  }
+
   // got a request, generate a response
-  // first parse the command and put response in buffer with space
-  // for the length and response code.
-  size_t wbuf_msg_start = conn->wbuf_contents_size + 4 + 4;
-  size_t next_size = wbuf_msg_start + len;
+  std::string out;
+  do_request(cmd, out);
+  if (4 + out.size() > k_max_msg) {
+    out.clear();
+    out_err(out, ERR_2BIG, "response is too big");
+  }
+
+  // pack response into the buffer
+  size_t wbuf_msg_start = conn->wbuf_contents_size + 4;
+  size_t next_size = wbuf_msg_start + out.size();
   if (next_size <= sizeof(conn->wbuf)) {
-    uint32_t wlen = 0;
-    uint32_t rescode = 0;
-    int32_t err = do_request(&conn->rbuf[conn->rbuf_consumed + 4], len,
-                             &rescode, &conn->wbuf[wbuf_msg_start], &wlen);
-    if (err) {
-      conn->state = STATE_END;
-      return false;
-    }
-    wlen += 4;
+    uint32_t wlen = (uint32_t)out.size();
     memcpy(&conn->wbuf[conn->wbuf_contents_size], &wlen, 4);
-    memcpy(&conn->wbuf[conn->wbuf_contents_size + 4], &rescode, 4);
-    conn->wbuf_contents_size +=
-        4 + wlen; // wlen includes the rescode, then +4 for wlen
+    memcpy(&conn->wbuf[conn->wbuf_contents_size + 4], out.data(), out.size());
+    conn->wbuf_contents_size += 4 + wlen;
   } else {
+    conn->resp_cache.swap(out);
     conn->state = STATE_RES;
     return false;
   }
@@ -533,8 +574,8 @@ int main() {
   // ========================
   // event loop:
   // ========================
-  // map of client connections, keyed by fd because fds start at 0 and increment
-  // by 1
+  // map of client connections, keyed by fd because fds start at 0 and
+  // increment by 1
   std::vector<Conn *> fd2conn;
 
   // set listening socket to nonblocking

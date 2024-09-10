@@ -103,6 +103,94 @@ static int32_t send_req(int fd, const std::vector<std::string> &cmd) {
   return write_all(fd, wbuf, size_with_header);
 }
 
+enum {
+  SER_NIL = 0, // like NULL
+  SER_ERR = 1, // error code and a message
+  SER_STR = 2, // string
+  SER_INT = 3, // int64
+  SER_ARR = 4, // array
+};
+
+static int32_t on_response(const uint8_t *data, size_t size) {
+  if (size < 1) {
+    msg("bad response");
+    return -1;
+  }
+  switch (data[0]) {
+  case SER_NIL:
+    printf("(nil)\n");
+    return 1;
+  case SER_ERR:
+    if (size < 1 + 8) {
+      msg("bad response");
+      return -1;
+    }
+    {
+      int32_t code = 0;
+      int32_t len = 0;
+      memcpy(&code, &data[1], 4);
+      memcpy(&len, &data[1 + 4], 4);
+      if (size < 1 + 8 + len) {
+        msg("bad response");
+        return -1;
+      }
+      printf("(err) %d %.*s\n", code, len, &data[1 + 8]);
+      return 1 + 8 + len;
+    }
+  case SER_STR:
+    if (size < 1 + 4) {
+      msg("bad response");
+      return -1;
+    }
+    {
+      uint32_t len = 0;
+      memcpy(&len, &data[1], 4);
+      if (size < 1 + 4 + len) {
+        msg("bad response");
+        return -1;
+      }
+      printf("(str) %.*s\n", len, &data[1 + 4]);
+      return 1 + 4 + len;
+    }
+  case SER_INT:
+    if (size < 1 + 8) {
+      msg("bad response");
+      return -1;
+    }
+    {
+      int64_t val = 0;
+      memcpy(&val, &data[1], 8);
+      printf("(int) %lld\n", val);
+      return 1 + 8;
+    }
+  case SER_ARR:
+    if (size < 1 + 4) {
+      msg("bad response");
+      return -1;
+    }
+    {
+      uint32_t len = 0;
+      memcpy(&len, &data[1], 4);
+      printf("(arr) len=%u\n", len);
+      size_t arr_pos = 1 + 4;
+      for (uint32_t i = 0; i < len; i++) {
+        // with the recursion for arrays, it doesn't matter how nested the data
+        // may be.
+        int32_t rv = on_response(&data[arr_pos], size - arr_pos);
+        if (rv < 0) {
+          return rv;
+        }
+        arr_pos += rv;
+      }
+      printf("(arr) end\n");
+      return ((int32_t)arr_pos);
+    }
+  default:
+    msg("bad response");
+    return -1;
+  }
+}
+
 static int32_t read_res(int fd) {
   // parse a response, beginning with the 4-byte header
   char rbuf[4 + k_max_msg + 1];
@@ -123,10 +211,6 @@ static int32_t read_res(int fd) {
     msg("too long");
     return -1;
   }
-  if (len < 4) {
-    msg("bad response");
-    return -1;
-  }
 
   // parse reply body
   err = read_full(fd, &rbuf[4], len);
@@ -135,11 +219,13 @@ static int32_t read_res(int fd) {
     return -1;
   }
 
-  uint32_t rescode = 0;
   // do something
-  memcpy(&rescode, &rbuf[4], 4);
-  printf("server says: [%u] %.*s\n", rescode, len - 4, &rbuf[8]);
-  return 0;
+  int32_t rv = on_response((uint8_t *)&rbuf[4], len);
+  if (rv > 0 && (uint32_t)rv != len) {
+    msg("bad response");
+    rv = -1;
+  }
+  return rv;
 }
 
 int main(int argc, char **argv) {

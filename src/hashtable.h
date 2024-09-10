@@ -31,3 +31,4 @@ HNode *hm_lookup(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *));
 HNode *hm_pop(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *));
 size_t hm_size(HMap *hmap);
 void hm_destroy(HMap *hmap);
+void h_scan(HTable *tab, void (*f)(HNode *, void *), void *arg);

@@ -8,7 +8,7 @@
 // n must be a power of 2
 static void h_init(HTable *htab, size_t n) {
   // remembering that powers of 2 have the bitwise form of 10...0, (n - 1) & n
-  // will always be zero for powers of 2 as the subtraction cascades up the
+  // will always be zero for powers of 2 as the subtraction cascades down the
   // bits, inverting each of them.
   assert(n > 0 && ((n - 1) & n) == 0);
   htab->tab =
@@ -29,7 +29,7 @@ static void h_insert(HTable *htab, HNode *node) {
   htab->size++;
 }
 
-// `eq` is a callback funciton passed in for comparing hash codes.
+// `eq` is a callback function passed in for comparing keys.
 // the address of the incoming pointer is returned, rather than the
 // node pointer, to facilitate deletions.
 static HNode **h_lookup(HTable *htab, HNode *key,
@@ -52,13 +52,26 @@ static HNode **h_lookup(HTable *htab, HNode *key,
 
 // receive the address of an incoming pointer to a node gained from
 // h_lookup and detach that node from the HTable, returning the
-// address of the pointer.
+// pointer.
 static HNode *h_detach(HTable *htab, HNode **from) {
   HNode *node = *from; // de-reference the address to get a pointer to an HNode
   *from = node->next;  // the pointer at *from now points to the next node.
   htab->size--;
   return node; // we're returning the node, so we don't even need to clean up
                // here.
+}
+
+void h_scan(HTable *tab, void (*f)(HNode *, void *), void *arg) {
+  if (tab->size == 0) {
+    return;
+  }
+  for (size_t i = 0; i < tab->mask + 1; i++) {
+    HNode *node = tab->tab[i];
+    while (node) {
+      f(node, arg);
+      node = node->next;
+    }
+  }
 }
 
 /*==================================================
