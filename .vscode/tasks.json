@@ -4,12 +4,12 @@
         {
             "label": "compile",
             "type": "shell",
-            "command": "clang++ -std=c++11 -glldb -fstandalone-debug ${relativeFileDirname}/*.cpp -o ${workspaceFolder}/${fileBasenameNoExtension}"
+            "command": "clang++ -std=c++11 -glldb -fstandalone-debug ${relativeFile} src/avltree.cpp -o ${workspaceFolder}/${fileBasenameNoExtension}"
         },
         {
             "label": "compile g++",
             "type": "shell",
-            "command": "g++ -g -ggdb ${relativeFile} src/hashtable.cpp -o ${fileBasenameNoExtension}"
+            "command": "g++ -g -ggdb ${relativeFile} src/avltree.cpp -o ${fileBasenameNoExtension}"
         },
         {
             "label": "clean",

@@ -21,6 +21,16 @@
            "expressions": "native",
            "program": "${workspaceFolder}/${fileBasenameNoExtension}",
            "args": ["set", "k", "v"]
+       },
+       {
+           "type": "codelldb",
+           "request": "launch",
+           "name": "avl debug",
+           "console": "integratedTerminal",
+           "preLaunchTask": "compile",
+           "postDebugTask": "clean",
+           "expressions": "native",
+           "program": "${workspaceFolder}/${fileBasenameNoExtension}"
        }
    ]
 }

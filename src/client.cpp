@@ -1,3 +1,4 @@
+#include "common.h"
 #include <arpa/inet.h>
 #include <assert.h>
 #include <cstdint>
@@ -102,14 +103,6 @@ static int32_t send_req(int fd, const std::vector<std::string> &cmd) {
   fill_with_cmd(wbuf, pos, cmd);
   return write_all(fd, wbuf, size_with_header);
 }
-
-enum {
-  SER_NIL = 0, // like NULL
-  SER_ERR = 1, // error code and a message
-  SER_STR = 2, // string
-  SER_INT = 3, // int64
-  SER_ARR = 4, // array
-};
 
 static int32_t on_response(const uint8_t *data, size_t size) {
   if (size < 1) {

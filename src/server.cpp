@@ -1,3 +1,4 @@
+#include "common.h"
 #include "hashtable.h"
 #include <arpa/inet.h>
 #include <cassert>
@@ -33,12 +34,6 @@
  * happens most often with EAGAIN signals.
  */
 
-#define container_of(ptr, type, member)                                        \
-  ({                                                                           \
-    const typeof(((type *)0)->member) *__mptr = (ptr);                         \
-    (type *)((char *)__mptr - offsetof(type, member));                         \
-  })
-
 const size_t k_max_msg = 4096;
 
 enum {
@@ -50,14 +45,6 @@ enum {
 enum {
   ERR_UNKNOWN = 0,
   ERR_2BIG = 1,
-};
-
-enum {
-  SER_NIL = 0, // like NULL
-  SER_ERR = 1, // error code and a message
-  SER_STR = 2, // string
-  SER_INT = 3, // int64
-  SER_ARR = 4, // array
 };
 
 // placeholder data structure for the key space
@@ -261,15 +248,6 @@ struct Entry {
   std::string key;
   std::string val;
 };
-
-// I'll need to look up an explanation for this one
-static uint64_t str_hash(const unsigned char *data, size_t len) {
-  uint32_t h = 0x811C9DC5;
-  for (size_t i = 0; i < len; i++) {
-    h = (h + data[i]) * 0x01000193;
-  }
-  return h;
-}
 
 static bool entry_eq(HNode *lhs, HNode *rhs) {
   struct Entry *le = container_of(lhs, struct Entry, node);
