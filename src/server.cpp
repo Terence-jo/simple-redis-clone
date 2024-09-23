@@ -1,5 +1,6 @@
 #include "common.h"
 #include "hashtable.h"
+#include "zset.h"
 #include <arpa/inet.h>
 #include <cassert>
 #include <cerrno>
@@ -243,10 +244,18 @@ static struct {
   HMap db;
 } g_data;
 
+// flag for data type in Entry
+enum {
+  T_STR = 0,
+  T_ZSET = 1,
+};
+
 struct Entry {
   struct HNode node;
   std::string key;
+  uint32_t type = 0;
   std::string val;
+  ZSet *zset = NULL;
 };
 
 static bool entry_eq(HNode *lhs, HNode *rhs) {
