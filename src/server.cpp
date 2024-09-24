@@ -46,6 +46,8 @@ enum {
 enum {
   ERR_UNKNOWN = 0,
   ERR_2BIG = 1,
+  ERR_ARG = 2,
+  ERR_TYPE = 3,
 };
 
 // placeholder data structure for the key space
@@ -236,9 +238,6 @@ static bool cmd_is(const std::string &cmd, const char *cmd_wanted) {
   return 0 == strcasecmp(cmd.c_str(), cmd_wanted);
 }
 
-/*==================================================
-Hashtable functionality
-==================================================*/
 // the global key space
 static struct {
   HMap db;
@@ -258,6 +257,14 @@ struct Entry {
   ZSet *zset = NULL;
 };
 
+/*
+ * The functions that perform lookups in the key space duplicate the
+ * same lookup snippet many times. This smells to me, but the alternative
+ * would be heap allocations for every lookup right? That sounds like a
+ * pretty big performance compromise for what is supposed to a blazing-fast
+ * in-memory DB.
+ */
+
 static bool entry_eq(HNode *lhs, HNode *rhs) {
   struct Entry *le = container_of(lhs, struct Entry, node);
   struct Entry *re = container_of(rhs, struct Entry, node);
@@ -270,6 +277,11 @@ static void out_str(std::string &out, const std::string &val) {
   uint32_t len = (uint32_t)val.size();
   out.append((char *)&len, 4);
   out.append(val);
+}
+static void out_str(std::string &out, const char *val, size_t len) {
+  out.push_back(SER_STR);
+  out.append((char *)&len, 4);
+  out.append(val, len);
 }
 static void out_int(std::string &out, int64_t val) {
   out.push_back(SER_INT);
@@ -287,10 +299,25 @@ static void out_arr(std::string &out, uint32_t n) {
   out.push_back(SER_ARR);
   out.append((char *)&n, 4);
 }
+static void out_dbl(std::string &out, double val) {
+  out.push_back(SER_DBL);
+  out.append((char *)&val, 8);
+}
 
 static void cb_scan(HNode *node, void *arg) {
   std::string &out = *(std::string *)arg;
   out_str(out, container_of(node, Entry, node)->key);
+}
+
+static void *begin_arr(std::string &out) {
+  out.push_back(SER_ARR);
+  out.append("\0\0\0\0", 4);       // this is filled in end_arr()
+  return (void *)(out.size() - 4); // the `ctx` arg for end_arr
+}
+static void end_arr(std::string &out, void *ctx, uint32_t n) {
+  size_t pos = (size_t)ctx;
+  assert(out[pos - 1] == SER_ARR);
+  memcpy(&out[pos], &n, 4);
 }
 
 static void do_keys(std::vector<std::string> &cmd, std::string &out) {
@@ -361,6 +388,136 @@ static void do_del(const std::vector<std::string> &cmd, std::string &out) {
   return;
 }
 
+static bool str_to_dbl(const std::string &s, double &out) {
+  char *endp = NULL;
+  out = strtod(s.c_str(), &endp);
+  return endp == s.c_str() + s.size() && !isnan(out);
+}
+
+static bool str_to_int(const std::string &s, int64_t &out) {
+  char *endp = NULL;
+  out = strtoll(s.c_str(), &endp, 10); // base 10
+  return endp == s.c_str() + s.size();
+}
+
+static bool expect_zset(std::string &out, std::string &s, Entry **ent) {
+  Entry key;
+  key.key.swap(s);
+  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+  HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (!hnode) {
+    out_nil(out);
+    return false;
+  }
+
+  *ent = container_of(hnode, Entry, node);
+  if ((*ent)->type != T_ZSET) {
+    out_err(out, ERR_TYPE, "expect zset");
+    return false;
+  }
+  return true;
+}
+
+// first argument will be the key at which to add to a zset,
+// second will be the score, third will be the name. expect_zset
+// will handle the key and help graceful exits.
+static void do_zadd(std::vector<std::string> &cmd, std::string &out) {
+  // parse score and name
+  double score = 0;
+  if (!str_to_dbl(cmd[2], score)) {
+    return out_err(out, ERR_ARG, "expect fp number for score");
+  }
+
+  // lookup or create the zset
+  // TODO: consider replacing lookup here with `expect_zset`
+  Entry target;
+  target.key.swap(cmd[1]);
+  target.node.hcode = str_hash((uint8_t *)target.key.data(), target.key.size());
+  HNode *hnode = hm_lookup(&g_data.db, &target.node, &entry_eq);
+
+  Entry *ent = NULL;
+  if (!hnode) {
+    ent = new Entry();
+    ent->key.swap(target.key);
+    ent->node.hcode = target.node.hcode;
+    ent->type = T_ZSET;
+    ent->zset = new ZSet();
+    hm_insert(&g_data.db, &ent->node);
+  } else {
+    ent = container_of(hnode, Entry, node);
+    if (ent->type != T_ZSET) {
+      out_err(out, ERR_TYPE, "expect zset for zadd");
+    }
+  }
+
+  // add or update the (score, name) tuple
+  const std::string &name = cmd[3];
+  bool added = zset_add(ent->zset, name.c_str(), name.size(), score);
+  out_int(out, (int64_t)added);
+  return;
+}
+
+// this will have key and name arguments. it will lean on `expect_zset`
+// and return an error if there is a non-zset there.
+static void do_zrem(std::vector<std::string> &cmd, std::string &out) {
+  Entry *ent = NULL;
+  if (!expect_zset(out, cmd[1], &ent)) {
+    // expect_zset will have added the error or nil.
+    return;
+  }
+
+  const std::string &name = cmd[2];
+  ZNode *node = zset_pop(ent->zset, name.data(), (size_t)name.size());
+  if (!node) {
+    out_int(out, 0);
+    return;
+  }
+  znode_del(node);
+  out_int(out, 1);
+  return;
+}
+
+static void do_zquery(std::vector<std::string> &cmd, std::string &out) {
+  // parse command
+  double score = 0;
+  if (!str_to_dbl(cmd[2], score)) {
+    return out_err(out, ERR_ARG, "expect fp number for score");
+  }
+  const std::string name = cmd[3];
+  int64_t offset = 0;
+  int64_t limit = 0;
+  if (!str_to_int(cmd[4], offset)) {
+    return out_err(out, ERR_ARG, "expect int for offset");
+  }
+  if (!str_to_int(cmd[5], limit)) {
+    return out_err(out, ERR_ARG, "expect int for limit");
+  }
+
+  Entry *ent = NULL;
+  if (!expect_zset(out, cmd[1], &ent)) {
+    if (out[0] == SER_NIL) {
+      out.clear();
+      out_arr(out, 0);
+    }
+    return;
+  }
+
+  // 1. seek
+  ZNode *znode = zset_query(ent->zset, score, name.data(), name.size());
+  // 2. offset
+  znode = znode_offset(znode, offset);
+  // 3. iterate and output
+  void *arr = begin_arr(out);
+  uint32_t n = 0;
+  while (znode && (int64_t)n < limit) {
+    out_str(out, znode->name, znode->len);
+    out_dbl(out, znode->score);
+    znode = znode_offset(znode, +1);
+    n += 2;
+  }
+  end_arr(out, arr, n);
+}
+
 static void do_request(std::vector<std::string> &cmd, std::string &out) {
   if (cmd.size() == 1 && cmd_is(cmd[0], "keys")) {
     do_keys(cmd, out);
@@ -370,6 +527,14 @@ static void do_request(std::vector<std::string> &cmd, std::string &out) {
     do_set(cmd, out);
   } else if (cmd.size() == 2 && cmd_is(cmd[0], "del")) {
     do_del(cmd, out);
+  } else if (cmd.size() == 4 && cmd_is(cmd[0], "zadd")) {
+    do_zadd(cmd, out);
+  } else if (cmd.size() == 3 && cmd_is(cmd[0], "zrem")) {
+    do_zrem(cmd, out);
+  } else if (cmd.size() == 3 && cmd_is(cmd[0], "zscore")) {
+    do_zscore(cmd, out);
+  } else if (cmd.size() == 6 && cmd_is(cmd[0], "zquery")) {
+    do_zquery(cmd, out);
   } else {
     out_err(out, ERR_UNKNOWN, "Unknown cmd");
   }

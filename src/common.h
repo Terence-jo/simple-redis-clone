@@ -24,4 +24,5 @@ enum {
   SER_STR = 2, // string
   SER_INT = 3, // int64
   SER_ARR = 4, // array
+  SER_DBL = 5,
 };

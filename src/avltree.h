@@ -18,3 +18,4 @@ AVLNode *avl_del(AVLNode *node);
 uint32_t avl_count(AVLNode *node);
 uint32_t avl_depth(AVLNode *node);
 uint32_t max(uint32_t lhs, uint32_t rhs);
+AVLNode *avl_offset(AVLNode *node, int64_t offset);

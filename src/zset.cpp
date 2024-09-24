@@ -111,7 +111,7 @@ bool zset_add(ZSet *zset, const char *name, size_t len, double score) {
   }
 }
 
-static ZNode *zset_pop(ZSet *zset, const char *name, size_t len) {
+ZNode *zset_pop(ZSet *zset, const char *name, size_t len) {
   ZNode *node = zset_lookup(zset, name, len);
   if (!node) {
     return NULL;
@@ -124,3 +124,38 @@ static ZNode *zset_pop(ZSet *zset, const char *name, size_t len) {
 // zset_add allocates the node, so zset_del will need to deallocate the
 // node in the same module.
 void znode_del(ZNode *node) { free(node); }
+
+// this will be part of our `ZQUERY key score name offset limit` command.
+ZNode *zset_query(ZSet *zset, double score, const char *name, size_t len) {
+  AVLNode *found = NULL;
+  for (AVLNode *cur = zset->tree; cur;) {
+    if (zless(cur, score, name, len)) {
+      // if we're not yet greater than or equal to the desired (score, name)
+      // then we need a greater node.
+      cur = cur->right;
+    } else {
+      found = cur; // a candidate
+      cur = cur->left;
+    }
+  }
+  return found ? container_of(found, ZNode, tree) : NULL;
+}
+
+ZNode *znode_offset(ZNode *node, int64_t offset) {
+  AVLNode *tnode = node ? avl_offset(&node->tree, offset) : NULL;
+  return tnode ? container_of(tnode, ZNode, tree) : NULL;
+}
+
+static void tree_dispose(AVLNode *node) {
+  if (!node) {
+    return;
+  }
+  tree_dispose(node->left);
+  tree_dispose(node->right);
+  znode_del(container_of(node, ZNode, tree));
+}
+
+void zset_dispose(ZSet *zset) {
+  tree_dispose(zset->tree);
+  hm_destroy(&zset->hmap);
+}
