@@ -178,6 +178,17 @@ static int32_t on_response(const uint8_t *data, size_t size) {
       printf("(arr) end\n");
       return ((int32_t)arr_pos);
     }
+  case SER_DBL:
+    if (size < 1 + 8) {
+      msg("bad response");
+      return -1;
+    }
+    {
+      double val = 0;
+      memcpy(&val, &data[1], 8);
+      printf("(dbl) %f\n", val);
+      return 1 + 8;
+    }
   default:
     msg("bad response");
     return -1;

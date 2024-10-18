@@ -1,5 +1,6 @@
 #include "common.h"
 #include "hashtable.h"
+#include "list.h"
 #include "zset.h"
 #include <arpa/inet.h>
 #include <cassert>
@@ -7,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <errno.h>
 #include <fcntl.h>
 #include <map>
@@ -36,6 +38,7 @@
  */
 
 const size_t k_max_msg = 4096;
+const uint64_t k_idle_timeout_ms = 5 * 1000;
 
 enum {
   STATE_REQ = 0,
@@ -67,6 +70,8 @@ struct Conn {
   // cache for a response that could not be written
   // to the buffer
   std::string resp_cache;
+  uint64_t idle_start = 0;
+  DList idle_list;
 };
 
 // Print error and exit. A C idiom.
@@ -77,6 +82,12 @@ static void die(const char *msg) {
 }
 
 static void msg(const char *msg) { fprintf(stderr, "%s\n", msg); }
+
+uint64_t get_monotonic_usec() {
+  timespec tv = {0, 0};
+  clock_gettime(CLOCK_MONOTONIC, &tv);
+  return uint64_t(tv.tv_sec) * 1000000 + tv.tv_nsec / 1000;
+}
 
 // set a socket to read and write in non-blocking mode
 static void fd_set_nb(int fd) {
@@ -104,34 +115,6 @@ static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn) {
     fd2conn.resize(conn->fd + 1);
   }
   fd2conn[conn->fd] = conn;
-}
-
-static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int serverfd) {
-  struct sockaddr_in client_addr = {};
-  socklen_t addrlen = sizeof(client_addr);
-  int connfd = accept(serverfd, (struct sockaddr *)&client_addr, &addrlen);
-  if (connfd < 0) {
-    msg("accept() error");
-    return -1;
-  }
-
-  // set up connection
-  fd_set_nb(connfd);
-  // need to heap-allocate the connection since it will outlive this function
-  // and we're passing its pointer around.
-  struct Conn *conn = (struct Conn *)malloc(sizeof(struct Conn));
-  if (!conn) {
-    close(connfd);
-    return -1;
-  }
-  conn->fd = connfd;
-  conn->state = STATE_REQ;
-  conn->rbuf_contents_size = 0;
-  conn->rbuf_consumed = 0;
-  conn->wbuf_contents_size = 0;
-  conn->wbuf_sent = 0;
-  conn_put(fd2conn, conn);
-  return 0;
 }
 
 static bool try_one_request(Conn *conn);
@@ -241,6 +224,8 @@ static bool cmd_is(const std::string &cmd, const char *cmd_wanted) {
 // the global key space
 static struct {
   HMap db;
+  std::vector<Conn *> fd2conn;
+  DList idle_list;
 } g_data;
 
 // flag for data type in Entry
@@ -477,6 +462,25 @@ static void do_zrem(std::vector<std::string> &cmd, std::string &out) {
   return;
 }
 
+// retrieve score given name
+static void do_zscore(std::vector<std::string> &cmd, std::string &out) {
+  Entry *ent = NULL;
+  if (!expect_zset(out, cmd[1], &ent)) {
+    // it will be SER_NIL or an error, either is an appropriate replacement
+    // for an absent name.
+    return;
+  }
+
+  const std::string &name = cmd[2];
+  ZNode *node = zset_lookup(ent->zset, name.data(), name.size());
+  if (!node) {
+    out_nil(out);
+    return;
+  }
+  out_dbl(out, node->score);
+  return;
+}
+
 static void do_zquery(std::vector<std::string> &cmd, std::string &out) {
   // parse command
   double score = 0;
@@ -649,6 +653,11 @@ static void state_req(Conn *conn) {
 
 // state machine for client connections:
 static void connection_io(Conn *conn) {
+  // woken up by new event, update timer and move to front of list
+  conn->idle_start = get_monotonic_usec();
+  dlist_detach(&conn->idle_list);
+  dlist_insert_before(&g_data.idle_list, &conn->idle_list);
+
   if (conn->state == STATE_REQ) {
     state_req(conn);
   } else if (conn->state == STATE_RES) {
@@ -687,6 +696,74 @@ int new_listening_kqueue(int fd) {
   return kq;
 }
 
+static uint32_t next_timer_ms() {
+  if (dlist_empty(&g_data.idle_list)) {
+    return 10000;
+  }
+
+  uint64_t now_us = get_monotonic_usec();
+  Conn *next = container_of(g_data.idle_list.next, Conn, idle_list);
+  uint64_t next_us = next->idle_start + k_idle_timeout_ms * 1000;
+  if (next_us < now_us) {
+    // missed?
+    return 0;
+  }
+  return (uint32_t)((next_us - now_us) / 1000);
+}
+
+static int32_t accept_new_conn(int serverfd) {
+  struct sockaddr_in client_addr = {};
+  socklen_t addrlen = sizeof(client_addr);
+  int connfd = accept(serverfd, (struct sockaddr *)&client_addr, &addrlen);
+  if (connfd < 0) {
+    msg("accept() error");
+    return -1;
+  }
+
+  // set up connection
+  fd_set_nb(connfd);
+  // need to heap-allocate the connection since it will outlive this function
+  // and we're passing its pointer around.
+  struct Conn *conn = (struct Conn *)malloc(sizeof(struct Conn));
+  if (!conn) {
+    close(connfd);
+    return -1;
+  }
+  conn->fd = connfd;
+  conn->state = STATE_REQ;
+  conn->rbuf_contents_size = 0;
+  conn->rbuf_consumed = 0;
+  conn->wbuf_contents_size = 0;
+  conn->wbuf_sent = 0;
+  conn->idle_start = get_monotonic_usec();
+  // fresh timer, insert at back of list (cyclic list remember)
+  dlist_insert_before(&g_data.idle_list, &conn->idle_list);
+  conn_put(g_data.fd2conn, conn);
+  return 0;
+}
+
+static void conn_done(Conn *conn) {
+  g_data.fd2conn[conn->fd] = NULL;
+  dlist_detach(&conn->idle_list);
+  (void)close(conn->fd);
+  free(conn);
+}
+
+static void process_timers() {
+  uint64_t now_us = get_monotonic_usec();
+  while (!dlist_empty(&g_data.idle_list)) {
+    Conn *next = container_of(g_data.idle_list.next, Conn, idle_list);
+    uint64_t next_us = next->idle_start + k_idle_timeout_ms * 1000;
+    if (next_us >= now_us + 1000) {
+      // not ready to fire, add 1000 to compensate for ms resolution of poll.
+      // may or may not be relevant when using kqueue
+      break;
+    }
+    printf("removing idle connection %d\n", next->fd);
+    conn_done(next);
+  }
+}
+
 int main() {
   // Create a TCP socket. PF_INET is for IPV4, SOCK_STREAM is for TCP.
   int serverfd = socket(PF_INET, SOCK_STREAM, 0);
@@ -699,6 +776,7 @@ int main() {
   // must provide its size.
   setsockopt(serverfd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
+  dlist_init(&g_data.idle_list);
   //======================
   // Binding an address
   //======================
@@ -726,10 +804,6 @@ int main() {
   // ========================
   // event loop:
   // ========================
-  // map of client connections, keyed by fd because fds start at 0 and
-  // increment by 1
-  std::vector<Conn *> fd2conn;
-
   // set listening socket to nonblocking
   fd_set_nb(serverfd);
 
@@ -737,7 +811,7 @@ int main() {
   int kq = new_listening_kqueue(serverfd);
   while (true) {
     // connection fds, make sure they're all in the event queue
-    for (Conn *conn : fd2conn) {
+    for (Conn *conn : g_data.fd2conn) {
       if (!conn) {
         continue;
       }
@@ -754,39 +828,40 @@ int main() {
       }
     }
 
+    int timeout_ms = (int)next_timer_ms();
+    timespec tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
     // TODO: Figure out what goes into optimising event array size and number
     // of events retrieved at once
     struct kevent event[10];
     // check for events, only handle one per iteration of the event loop.
     // this blocks indefinitely when there are no events. is that ok?
-    int new_events = kevent(kq, NULL, 0, event, 1, NULL);
+    int new_events = kevent(kq, NULL, 0, event, 1, &tv);
     if (new_events < 0) {
       msg("kevent() retrieval error");
       return -1;
     } else if (new_events == 0) {
-      msg("no events");
+      process_timers();
       continue;
-    }
-
-    // process active connections, skipping the listening socket
-    int event_fd = event->ident;
-    if (event_fd == serverfd) {
-      // new connection request, accept
-      (void)accept_new_conn(fd2conn, serverfd);
-    } else if (event->flags & EVFILT_READ) {
-      Conn *conn = fd2conn[event_fd];
-      if (event->flags & EV_EOF) {
-        // client has closed
-        conn->state = STATE_END;
-      } else {
-        connection_io(conn);
+    } else {
+      // process active connections, skipping the listening socket
+      int event_fd = event->ident;
+      if (event_fd == serverfd) {
+        // new connection request, accept
+        (void)accept_new_conn(serverfd);
+      } else if (event->flags & EVFILT_READ) {
+        Conn *conn = g_data.fd2conn[event_fd];
+        if (event->flags & EV_EOF) {
+          // client has closed
+          conn->state = STATE_END;
+        } else {
+          connection_io(conn);
+        }
+        if (conn->state == STATE_END) {
+          // Client closed or something bad happened, clean up
+          conn_done(conn);
+        }
       }
-      if (conn->state == STATE_END) {
-        // Client closed or something bad happened, clean up
-        fd2conn[conn->fd] = NULL;
-        (void)close(conn->fd);
-        free(conn);
-      }
+      process_timers();
     }
   }
 
