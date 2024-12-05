@@ -1,5 +1,6 @@
 #include "common.h"
 #include "hashtable.h"
+#include "heap.h"
 #include "list.h"
 #include "zset.h"
 #include <arpa/inet.h>
@@ -32,9 +33,13 @@
  * read buffer before the next read. A number of operations within the
  * pipelining loop may return false, breaking the loop and waiting for "the next
  * iteration". This is specifically the next iteration of the event loop, after
- * connections have been polled again. Read buffer contents for each connection
- * will persist until the buffer can be filled, processed, and cleared. This
- * happens most often with EAGAIN signals.
+ * connections have been polled again. In the case of one of these breaks, the
+ * reead buffer contents for each connection will persist until the buffer can
+ * be filled, processed, and cleared. This happens most often with EAGAIN
+ * signals.
+ *
+ * There is a lot of other stuff in here to facilitate redis-like operations and
+ * define the relevant protocol.
  */
 
 const size_t k_max_msg = 4096;
@@ -221,11 +226,15 @@ static bool cmd_is(const std::string &cmd, const char *cmd_wanted) {
   return 0 == strcasecmp(cmd.c_str(), cmd_wanted);
 }
 
-// the global key space
+// the global variables
 static struct {
   HMap db;
+  // map of all client connections, keyed by fd (really?)
   std::vector<Conn *> fd2conn;
+  // timers for idle connections
   DList idle_list;
+  // timers for TTLs on a heap
+  std::vector<HeapItem> heap;
 } g_data;
 
 // flag for data type in Entry
@@ -240,7 +249,56 @@ struct Entry {
   uint32_t type = 0;
   std::string val;
   ZSet *zset = NULL;
+  // for TTL in a heap
+  size_t heap_idx = -1;
 };
+
+// set or remove TTL
+static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
+  // We first want to check if the ttl is passed, and remove the heap item
+  // if so. We won't worry about deleting the entry here, that will happen
+  // in the calling function. We need to give the calling function a signal,
+  // which will be setting the heap index back to -1. When we remove the entry
+  // we will replace it with the back of the vector (popping it) and update
+  // the heap, only if the position is less than the heap size (invalid).
+  // Then we want to handle the case of setting or updating the ttl for a new
+  // or existing element. A new element will need a HeapItem created and
+  // populated, and the item's ref set to a pointer to the entry's heap_idx.
+  // Then either way the ttl will need to be set at `ttl_ms` into the future,
+  // and the heap will need to be updated.
+  if (ttl_ms < 0 && ent->heap_idx != -1) {
+    size_t pos = ent->heap_idx;
+    g_data.heap[pos] = g_data.heap.back();
+    g_data.heap.pop_back();
+    if (pos < g_data.heap.size()) {
+      heap_update(g_data.heap.data(), pos, g_data.heap.size());
+    }
+    ent->heap_idx = -1;
+  } else if (ttl_ms > 0) {
+    size_t pos = ent->heap_idx;
+    if (pos == (size_t)-1) {
+      HeapItem item;
+      item.ref = &ent->heap_idx;
+      g_data.heap.push_back(item);
+      pos = g_data.heap.size() - 1;
+    }
+    g_data.heap[pos].val = get_monotonic_usec() + (uint64_t)ttl_ms * 1000;
+    // this will update the heap_idx field of the entry based on where it
+    // ends up, which is why it's not worth setting ent->heap_idx above.
+    heap_update(g_data.heap.data(), pos, g_data.heap.size());
+  }
+}
+
+static void entry_del(Entry *ent) {
+  switch (ent->type) {
+  case T_ZSET:
+    zset_dispose(ent->zset);
+    delete ent->zset;
+    break;
+  }
+  entry_set_ttl(ent, -1);
+  delete ent;
+}
 
 /*
  * The functions that perform lookups in the key space duplicate the
@@ -372,7 +430,6 @@ static void do_del(const std::vector<std::string> &cmd, std::string &out) {
   out_int(out, node ? 1 : 0);
   return;
 }
-
 static bool str_to_dbl(const std::string &s, double &out) {
   char *endp = NULL;
   out = strtod(s.c_str(), &endp);
@@ -383,6 +440,13 @@ static bool str_to_int(const std::string &s, int64_t &out) {
   char *endp = NULL;
   out = strtoll(s.c_str(), &endp, 10); // base 10
   return endp == s.c_str() + s.size();
+}
+
+static void do_expire(std::vector<std::string> &cmd, std::string &out) {
+  int64_t ttl_ms = 0;
+  if (!str_to_int(cmd[2], ttl_ms)) {
+    return out_err(out, ERR_ARG, "expect int64");
+  }
 }
 
 static bool expect_zset(std::string &out, std::string &s, Entry **ent) {
@@ -696,15 +760,30 @@ int new_listening_kqueue(int fd) {
   return kq;
 }
 
+static bool hnode_same(HNode *lhs, HNode *rhs) { return lhs == rhs; }
+
+// use both idle and TTL timers, returning the nearest of either
 static uint32_t next_timer_ms() {
-  if (dlist_empty(&g_data.idle_list)) {
+  uint64_t now_us = get_monotonic_usec();
+  // cast -1 as uint to underflow to the max value. clever little trick
+  uint64_t next_us = (uint64_t)-1;
+
+  // idle timers
+  if (!dlist_empty(&g_data.idle_list)) {
+    Conn *next = container_of(g_data.idle_list.next, Conn, idle_list);
+    uint64_t next_us = next->idle_start + k_idle_timeout_ms * 1000;
+  }
+  // TTL timers
+  if (!g_data.heap.empty() && g_data.heap[0].val < next_us) {
+    next_us = g_data.heap[0].val;
+  }
+
+  if (next_us == (uint64_t)-1) {
+    // no timers
     return 10000;
   }
 
-  uint64_t now_us = get_monotonic_usec();
-  Conn *next = container_of(g_data.idle_list.next, Conn, idle_list);
-  uint64_t next_us = next->idle_start + k_idle_timeout_ms * 1000;
-  if (next_us < now_us) {
+  if (next_us <= now_us) {
     // missed?
     return 0;
   }
@@ -761,6 +840,20 @@ static void process_timers() {
     }
     printf("removing idle connection %d\n", next->fd);
     conn_done(next);
+  }
+
+  // TTL timers
+  const size_t k_max_works = 2000;
+  size_t n_works = 0;
+  while (!g_data.heap.empty() && g_data.heap[0].val < now_us) {
+    Entry *ent = container_of(g_data.heap[0].ref, Entry, heap_idx);
+    HNode *node = hm_pop(&g_data.db, &ent->node, &hnode_same);
+    assert(node == &ent->node);
+    entry_del(ent);
+    if (++n_works > k_max_works) {
+      // don't stall the server if many keys expire simultaneously
+      break;
+    }
   }
 }
 

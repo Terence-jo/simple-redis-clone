@@ -23,3 +23,4 @@ void znode_del(ZNode *node);
 ZNode *zset_query(ZSet *zset, double score, const char *name, size_t len);
 ZNode *znode_offset(ZNode *znode, int64_t offset);
 ZNode *zset_pop(ZSet *zset, const char *name, size_t len);
+void zset_dispose(ZSet *zset);

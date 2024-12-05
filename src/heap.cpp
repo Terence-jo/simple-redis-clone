@@ -1,10 +1,6 @@
+#include "heap.h"
 #include <cstddef>
 #include <cstdint>
-
-struct HeapItem {
-  uint64_t val = 0;
-  size_t *ref = NULL; // pointer to heap_idx field of an entry
-};
 
 static size_t heap_parent(size_t i) { return (i + 1) / 2 - 1; }
 
@@ -25,14 +21,6 @@ static void heap_up(HeapItem *a, size_t pos) {
 }
 
 static void heap_down(HeapItem *a, size_t pos, size_t len) {
-  // First we'll grab the value of the Item at pos and hang onto
-  // it. Then we want to find its place lower in the heap, so we will
-  // iterate down the heap, looking at each child of the current position
-  // to see which is smallest, breaking if none are smaller than the item
-  // we're pushing down. Whenever the children are smaller we swap the
-  // smallest among them into the parent's place and keep moving down. Only
-  // once we've broken the loop do we need to worry about putting the original
-  // item in the place of the last child we swapped upwards.
   HeapItem t = a[pos];
   while (true) {
     size_t l = heap_left(pos);
@@ -58,4 +46,12 @@ static void heap_down(HeapItem *a, size_t pos, size_t len) {
   }
   a[pos] = t;
   *a[pos].ref = pos;
+}
+
+void heap_update(HeapItem *a, size_t pos, size_t len) {
+  if (pos > 0 && a[heap_parent(pos)].val > a[pos].val) {
+    heap_up(a, pos);
+  } else {
+    heap_down(a, pos, len);
+  }
 }
