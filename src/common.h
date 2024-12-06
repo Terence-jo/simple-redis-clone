@@ -9,10 +9,19 @@
     (type *)((char *)__mptr - offsetof(type, member));                         \
   })
 
-// I'll need to look up an explanation for this one
+// FNV hash. fast but vulnerable. could implement a random prefix or suffix
+// to secure on an inter-process basis.
 inline uint64_t str_hash(const uint8_t *data, size_t len) {
+  // starting h is around 2B. hash is calculated by iteratively
+  // adding the next element of data to h and multiplying by
+  // a smaller 32-bit int.
+
+  // FNV basis offset, significantly affects overall distribution
   uint32_t h = 0x811C9DC5;
   for (size_t i = 0; i < len; i++) {
+    // multiply by FNV prime. it enhances the 'avalanche effect'
+    // increasing the chaotic nature of the hash and uniformity
+    // of output distribution.
     h = (h + data[i]) * 0x01000193;
   }
   return h;
