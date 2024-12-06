@@ -113,6 +113,18 @@ static void fd_set_nb(int fd) {
   }
 }
 
+static bool str_to_dbl(const std::string &s, double &out) {
+  char *endp = NULL;
+  out = strtod(s.c_str(), &endp);
+  return endp == s.c_str() + s.size() && !isnan(out);
+}
+
+static bool str_to_int(const std::string &s, int64_t &out) {
+  char *endp = NULL;
+  out = strtoll(s.c_str(), &endp, 10); // base 10
+  return endp == s.c_str() + s.size();
+}
+
 static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn) {
   // this takes advantage of the fact that `fd`s are assigned from 0
   // incrementing by 1 each time. the fd value is the number of fds.
@@ -229,7 +241,7 @@ static bool cmd_is(const std::string &cmd, const char *cmd_wanted) {
 // the global variables
 static struct {
   HMap db;
-  // map of all client connections, keyed by fd (really?)
+  // map of all client connections, keyed by fd
   std::vector<Conn *> fd2conn;
   // timers for idle connections
   DList idle_list;
@@ -255,17 +267,6 @@ struct Entry {
 
 // set or remove TTL
 static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
-  // We first want to check if the ttl is passed, and remove the heap item
-  // if so. We won't worry about deleting the entry here, that will happen
-  // in the calling function. We need to give the calling function a signal,
-  // which will be setting the heap index back to -1. When we remove the entry
-  // we will replace it with the back of the vector (popping it) and update
-  // the heap, only if the position is less than the heap size (invalid).
-  // Then we want to handle the case of setting or updating the ttl for a new
-  // or existing element. A new element will need a HeapItem created and
-  // populated, and the item's ref set to a pointer to the entry's heap_idx.
-  // Then either way the ttl will need to be set at `ttl_ms` into the future,
-  // and the heap will need to be updated.
   if (ttl_ms < 0 && ent->heap_idx != -1) {
     size_t pos = ent->heap_idx;
     g_data.heap[pos] = g_data.heap.back();
@@ -374,8 +375,7 @@ static void do_get(std::vector<std::string> &cmd, std::string &out) {
   // Create a key to find, fill it from the command and set its hash
   Entry target;
   target.key.swap(cmd[1]);
-  target.node.hcode =
-      str_hash((unsigned char *)target.key.data(), target.key.size());
+  target.node.hcode = str_hash((uint8_t *)target.key.data(), target.key.size());
 
   HNode *node = hm_lookup(&g_data.db, &target.node, &entry_eq);
   if (!node) {
@@ -396,8 +396,7 @@ static void do_set(std::vector<std::string> &cmd, std::string &out) {
   // provide a fast path.
   Entry target;
   target.key.swap(cmd[1]);
-  target.node.hcode =
-      str_hash((unsigned char *)target.key.data(), target.key.size());
+  target.node.hcode = str_hash((uint8_t *)target.key.data(), target.key.size());
   HNode *node = hm_lookup(&g_data.db, &target.node, &entry_eq);
   if (node) {
     container_of(node, Entry, node)->val.swap(cmd[2]);
@@ -420,8 +419,7 @@ static void do_set(std::vector<std::string> &cmd, std::string &out) {
 static void do_del(const std::vector<std::string> &cmd, std::string &out) {
   Entry target;
   target.key = cmd[1];
-  target.node.hcode =
-      str_hash((unsigned char *)target.key.data(), target.key.size());
+  target.node.hcode = str_hash((uint8_t *)target.key.data(), target.key.size());
 
   HNode *node = hm_pop(&g_data.db, &target.node, &entry_eq);
   if (node) {
@@ -430,23 +428,40 @@ static void do_del(const std::vector<std::string> &cmd, std::string &out) {
   out_int(out, node ? 1 : 0);
   return;
 }
-static bool str_to_dbl(const std::string &s, double &out) {
-  char *endp = NULL;
-  out = strtod(s.c_str(), &endp);
-  return endp == s.c_str() + s.size() && !isnan(out);
-}
-
-static bool str_to_int(const std::string &s, int64_t &out) {
-  char *endp = NULL;
-  out = strtoll(s.c_str(), &endp, 10); // base 10
-  return endp == s.c_str() + s.size();
-}
 
 static void do_expire(std::vector<std::string> &cmd, std::string &out) {
   int64_t ttl_ms = 0;
   if (!str_to_int(cmd[2], ttl_ms)) {
     return out_err(out, ERR_ARG, "expect int64");
   }
+
+  Entry target;
+  target.key.swap(cmd[1]);
+  target.node.hcode = str_hash((uint8_t *)target.key.data(), target.key.size());
+  HNode *node = hm_lookup(&g_data.db, &target.node, &entry_eq);
+  if (node) {
+    Entry *ent = container_of(node, Entry, node);
+    entry_set_ttl(ent, ttl_ms);
+  }
+  return out_int(out, node ? 1 : 0);
+}
+
+static void do_ttl(std::vector<std::string> &cmd, std::string &out) {
+  // query the TTL for an entry
+  Entry target;
+  target.key.swap(cmd[1]);
+  target.node.hcode = str_hash((uint8_t *)target.key.data(), target.key.size());
+  HNode *node = hm_lookup(&g_data.db, &target.node, &entry_eq);
+  if (!node) {
+    return out_int(out, -2);
+  }
+  Entry *ent = container_of(node, Entry, node);
+  if (ent->heap_idx == (size_t)-1) {
+    return out_int(out, -1);
+  }
+  uint64_t expire_at = g_data.heap[ent->heap_idx].val;
+  uint64_t now_us = get_monotonic_usec();
+  return out_int(out, expire_at > now_us ? (expire_at - now_us) / 1000 : 0);
 }
 
 static bool expect_zset(std::string &out, std::string &s, Entry **ent) {
