@@ -618,6 +618,10 @@ static void do_request(std::vector<std::string> &cmd, std::string &out) {
     do_zscore(cmd, out);
   } else if (cmd.size() == 6 && cmd_is(cmd[0], "zquery")) {
     do_zquery(cmd, out);
+  } else if (cmd.size() == 3 && cmd_is(cmd[0], "expire")) {
+    do_expire(cmd, out);
+  } else if (cmd.size() == 2 && cmd_is(cmd[0], "ttl")) {
+    do_ttl(cmd, out);
   } else {
     out_err(out, ERR_UNKNOWN, "Unknown cmd");
   }
