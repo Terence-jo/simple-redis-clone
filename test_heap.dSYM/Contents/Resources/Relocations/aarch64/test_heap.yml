@@ -1,0 +1,5 @@
+---
+triple:          'arm64-apple-darwin'
+binary-path:     '/Users/tjo/dev/repos/cpp-learning/build-your-own-redis/test_heap'
+relocations:     []
+...

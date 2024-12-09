@@ -25,9 +25,9 @@
        {
            "type": "codelldb",
            "request": "launch",
-           "name": "avl debug",
+           "name": "test debug",
            "console": "integratedTerminal",
-           "preLaunchTask": "compile",
+           "preLaunchTask": "compile single file",
            "postDebugTask": "clean",
            "expressions": "native",
            "program": "${workspaceFolder}/${fileBasenameNoExtension}"

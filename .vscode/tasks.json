@@ -2,9 +2,14 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "compile",
+            "label": "compile single file",
             "type": "shell",
-            "command": "clang++ -std=c++11 -glldb -fstandalone-debug ${relativeFile} src/avltree.cpp -o ${workspaceFolder}/${fileBasenameNoExtension}"
+            "command": "clang++ -std=c++11 -glldb -fstandalone-debug ${relativeFile} src/heap.cpp src/avltree.cpp src/zset.cpp src/hashtable.cpp -o ${workspaceFolder}/${fileBasenameNoExtension}"
+        },
+        {
+            "label": "compile single file",
+            "type": "shell",
+            "command": "g++ -g -ggdb ${relativeFile} -o ${workspaceFolder}/${fileBasenameNoExtension}"
         },
         {
             "label": "compile g++",

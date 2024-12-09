@@ -1,6 +1,7 @@
 #include "heap.cpp"
 #include <assert.h>
 #include <map>
+#include <sys/wait.h>
 #include <vector>
 
 struct Data {
@@ -41,4 +42,51 @@ static void del(Container &c, uint64_t val) {
   }
   delete d;
   c.map.erase(it);
+}
+
+static void verify(Container &c) {
+  // verify properties of heap for each position
+  assert(c.heap.size() == c.map.size());
+  for (size_t i = 0; i < c.heap.size(); i++) {
+    size_t l = heap_left(i);
+    size_t r = heap_right(i);
+    assert(l >= c.heap.size() || c.heap[l].val >= c.heap[i].val);
+    assert(r >= c.heap.size() || c.heap[r].val >= c.heap[i].val);
+    assert(*c.heap[i].ref == i);
+  }
+}
+
+static void test_case(size_t sz) {
+  for (uint32_t j = 0; j < 2 + sz * 2; ++j) {
+    Container c;
+    for (uint32_t i = 0; i < sz; ++i) {
+      add(c, 1 + i * 2);
+    }
+    verify(c);
+
+    add(c, j);
+    verify(c);
+
+    dispose(c);
+  }
+
+  for (uint32_t j = 0; j < sz; ++j) {
+    Container c;
+    for (uint32_t i = 0; i < sz; ++i) {
+      add(c, i);
+    }
+    verify(c);
+
+    del(c, j);
+    verify(c);
+
+    dispose(c);
+  }
+}
+
+int main() {
+  for (uint32_t i = 0; i < 200; ++i) {
+    test_case(i);
+  }
+  return 0;
 }

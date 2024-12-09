@@ -10,7 +10,7 @@ static size_t heap_right(size_t i) { return i * 2 + 2; }
 
 static void heap_up(HeapItem *a, size_t pos) {
   HeapItem t = a[pos];
-  while (pos > 0 && a[heap_parent(pos)].val < t.val) {
+  while (pos > 0 && a[heap_parent(pos)].val > t.val) {
     // swap
     a[pos] = a[heap_parent(pos)];
     *a[pos].ref = pos;
@@ -36,7 +36,7 @@ static void heap_down(HeapItem *a, size_t pos, size_t len) {
       min_pos = r;
       // min_val doesn't help past here in the iteration. no need to update
     }
-    if (min_pos == -1) {
+    if (min_pos == (size_t)-1) {
       break;
     }
     // swap and update the heap_idx in the containing entry
