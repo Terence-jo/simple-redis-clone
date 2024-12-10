@@ -2,6 +2,7 @@
 #include "hashtable.h"
 #include "heap.h"
 #include "list.h"
+#include "threadpool.h"
 #include "zset.h"
 #include <arpa/inet.h>
 #include <cassert>
@@ -247,6 +248,8 @@ static struct {
   DList idle_list;
   // timers for TTLs on a heap
   std::vector<HeapItem> heap;
+  // the thread pool
+  ThreadPool tp;
 } g_data;
 
 // flag for data type in Entry
@@ -290,15 +293,36 @@ static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
   }
 }
 
-static void entry_del(Entry *ent) {
+// deallocate key immediately
+static void entry_destroy(Entry *ent) {
   switch (ent->type) {
   case T_ZSET:
     zset_dispose(ent->zset);
     delete ent->zset;
     break;
   }
-  entry_set_ttl(ent, -1);
   delete ent;
+}
+
+static void entry_del_async(void *arg) { entry_destroy((Entry *)arg); }
+
+// dispose of entry after it gets detached from key space, potentially async
+static void entry_del(Entry *ent) {
+  entry_set_ttl(ent, -1);
+
+  const size_t k_large_container_size = 10000;
+  bool too_big = false;
+  switch (ent->type) {
+  case T_ZSET:
+    too_big = hm_size(&ent->zset->hmap) > k_large_container_size;
+    break;
+  }
+
+  if (too_big) {
+    thread_pool_queue(&g_data.tp, &entry_del_async, ent);
+  } else {
+    entry_destroy(ent);
+  }
 }
 
 /*
@@ -736,7 +760,7 @@ static void state_req(Conn *conn) {
 
 // state machine for client connections:
 static void connection_io(Conn *conn) {
-  // woken up by new event, update timer and move to front of list
+  // woken up by new event, update timer and move to back of (cyclic) list
   conn->idle_start = get_monotonic_usec();
   dlist_detach(&conn->idle_list);
   dlist_insert_before(&g_data.idle_list, &conn->idle_list);
@@ -888,7 +912,10 @@ int main() {
   // must provide its size.
   setsockopt(serverfd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
+  // some initialisations
   dlist_init(&g_data.idle_list);
+  thread_pool_init(&g_data.tp, 4);
+
   //======================
   // Binding an address
   //======================
