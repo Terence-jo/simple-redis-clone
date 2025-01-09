@@ -223,7 +223,6 @@ static int32_t parse_req(const unsigned char *req, uint32_t reqlen,
     if (pos + sz > reqlen) {
       return -1;
     }
-    // cast as char array and construct a string by passing length
     out.push_back(std::string((char *)&req[pos], sz));
     pos += sz;
   }
